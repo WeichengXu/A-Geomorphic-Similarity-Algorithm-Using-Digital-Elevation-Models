@@ -1,216 +1,150 @@
-import numpy as np
 from PIL import Image
+import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib import cm
-from matplotlib.colors import Normalize
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
 from matplotlib.cm import ScalarMappable
 from collections import Counter
 import rasterio
 
+
+def crop_tif(tif_path, row_start, row_end, col_start, col_end):
+    """
+    Crops a TIFF image and returns the cropped matrix.
+    """
+    image = Image.open(tif_path).convert('L')
+    image_matrix = np.array(image)
+    return image_matrix[row_start:row_end, col_start:col_end]
+
+
 def get_neighbor_pairs(grid):
     """
-    Reassigns grayscale values to integers 1-10 and computes squared sums of each cell with its neighbors.
-    Returns a list of squared sums.
+    Computes squared sums of each cell with its neighbors in a grid.
     """
-    # Ensure the grid is a NumPy array and prevent integer overflow
-    grid = grid.copy().astype(np.int32)  # Changed to int32 to prevent overflow
-
-    # Reassign grayscale values to integers 1-10
-    mapping = {
-        6: 1, 17: 2, 29: 3, 60: 4, 125: 5,
-        182: 6, 191: 7, 105: 8, 220: 9, 233: 10
-    }
-    for original_value, new_value in mapping.items():
-        grid[grid == original_value] = new_value
+    # Map grayscale values to integers for easier calculations
+    mapping = {6: 1, 17: 2, 29: 3, 60: 4, 125: 5, 182: 6, 191: 7, 105: 8, 220: 9, 233: 10}
+    for original, new in mapping.items():
+        grid[grid == original] = new
 
     rows, cols = grid.shape
     pairs = []
 
-    # Directions to consider (8-connectivity)
-    directions = [(-1, 0), (1, 0), (0, -1), (0, 1),
-                  (-1, -1), (-1, 1), (1, -1), (1, 1)]
-
-    # Loop through all cells in the grid
-    for idx_row in range(rows):
-        for idx_col in range(cols):
-            current_val = grid[idx_row, idx_col]
+    # Define neighbor directions
+    directions = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+    for row in range(rows):
+        for col in range(cols):
             for d_row, d_col in directions:
-                n_row, n_col = idx_row + d_row, idx_col + d_col
+                n_row, n_col = row + d_row, col + d_col
                 if 0 <= n_row < rows and 0 <= n_col < cols:
-                    neighbor_val = grid[n_row, n_col]
-                    pairs.append(current_val ** 2 + neighbor_val ** 2)
-
+                    pairs.append(grid[row, col]**2 + grid[n_row, n_col]**2)
     return pairs
+
 
 def value_counter(grid):
     """
     Counts occurrences of squared sums of cell values and their neighbors.
-    Returns a dictionary with counts for each possible squared sum.
     """
     number_list = get_neighbor_pairs(grid)
-    numbers = range(1, 11)
-    square_sums = [i ** 2 + j ** 2 for i in numbers for j in range(i, 11)]
+    square_sums = [i**2 + j**2 for i in range(1, 11) for j in range(i, 11)]
     counter = Counter(number_list)
+    return {val: counter.get(val, 0) for val in square_sums}
 
-    # Get counts for each value in square_sums
-    counts = {val: counter.get(val, 0) for val in square_sums}
-
-    return counts
 
 def wave_hedges_similarity(A, B):
     """
-    Calculates the Wave Hedges similarity index between two arrays.
+    Computes the Wave Hedges similarity index between two arrays.
     """
-    A = np.array(A)
-    B = np.array(B)
-
+    A, B = np.array(A), np.array(B)
     if A.shape != B.shape:
         raise ValueError("Input arrays must have the same shape.")
-
     numerator = np.abs(A - B)
     denominator = np.maximum(A, B)
+    non_zero = denominator != 0
+    similarity_sum = np.sum(numerator[non_zero] / denominator[non_zero])
+    return 1 - similarity_sum / len(A)
 
-    non_zero_indices = denominator != 0
 
-    if not np.any(non_zero_indices):
-        return 1.0  # Define similarity as 1 if all denominators are zero
-
-    similarity_sum = np.sum(numerator[non_zero_indices] / denominator[non_zero_indices])
-    similarity = 1 - (similarity_sum / len(A))
-
-    return similarity
-
-def crop_tif(tif_path, row_start, row_end, col_start, col_end):
+def similarity_index_for_matrix(tif_path, target_matrix, block_size, threshold):
     """
-    Crops a TIFF image to the specified bounds and returns the cropped matrix.
+    Computes the similarity index for each block compared to the target matrix.
     """
     image = Image.open(tif_path).convert('L')
     image_matrix = np.array(image)
-    cropped_matrix = image_matrix[row_start:row_end, col_start:col_end]
-    return cropped_matrix
-
-def similarity_index_for_matrix(image_matrix, target_matrix, block_size, threshold):
-    """
-    Computes the similarity index based on the number of similar blocks divided by all blocks except the target block.
-    Blocks with similarity above the threshold are considered similar.
-    """
     rows, cols = image_matrix.shape
-    block_list = []
-
-    # Split the image into blocks
-    for row in range(0, rows - block_size + 1, block_size):
-        for col in range(0, cols - block_size + 1, block_size):
-            block = image_matrix[row:row + block_size, col:col + block_size]
-            block_list.append(block)
-
-    similar_blocks = 0
-    total_blocks = len(block_list) - 1  # Exclude the target block
+    block_list = [
+        image_matrix[row:row + block_size, col:col + block_size]
+        for row in range(0, rows, block_size)
+        for col in range(0, cols, block_size)
+        if image_matrix[row:row + block_size, col:col + block_size].shape == (block_size, block_size)
+    ]
     target_counts = list(value_counter(target_matrix).values())
+    similar_blocks = sum(
+        wave_hedges_similarity(target_counts, list(value_counter(block).values())) >= threshold
+        for block in block_list
+    )
+    return similar_blocks / len(block_list)
 
-    for block in block_list:
-        block_counts = list(value_counter(block).values())
-        similarity = wave_hedges_similarity(target_counts, block_counts)
-        if np.array_equal(block, target_matrix):
-            continue  # Skip the target block
-        if similarity >= threshold:
-            similar_blocks += 1
-
-    if total_blocks > 0:
-        similarity_index = similar_blocks / total_blocks
-    else:
-        similarity_index = 0
-
-    return similarity_index
-
-def similarity_plot(tif_path, block_size, threshold):
-    """
-    Generates and displays a similarity index map for the given image based on the threshold.
-    """
-    image = Image.open(tif_path).convert('L')
-    image_matrix = np.array(image)
-    rows, cols = image_matrix.shape
-    block_positions = []
-    index_values = []
-
-    # Split the image into blocks and record their positions
-    for row in range(0, rows - block_size + 1, block_size):
-        for col in range(0, cols - block_size + 1, block_size):
-            block = image_matrix[row:row + block_size, col:col + block_size]
-            similarity = similarity_index_for_matrix(image_matrix, block, block_size, threshold)
-            index_values.append(similarity)
-            block_positions.append((row, col))
-
-    # Create similarity map
-    similarity_map = np.zeros((rows, cols), dtype=float)
-    for idx, (similarity, (row, col)) in enumerate(zip(index_values, block_positions)):
-        similarity_map[row:row + block_size, col:col + block_size] = similarity
-
-    # Plot similarity map
-    colormap = cm.get_cmap('coolwarm')
-    fig, ax = plt.subplots(figsize=(10, 10))
-    im = ax.imshow(similarity_map, cmap=colormap, vmin=0, vmax=1)
-    ax.axis('off')
-    fig.colorbar(im, ax=ax, orientation='vertical', label='Similarity Index (0 to 1)')
-    ax.set_title('Similarity Index Map')
-    plt.show()
-
-    return similarity_map
 
 def combined_similarity_plot(tif_path, block_size, threshold, alpha):
     """
-    Overlays the similarity index map onto the original image.
+    Generates a combined similarity plot with an overlay of the original image.
     """
+    # Load base image and prepare for overlay
     base_image = Image.open(tif_path).convert('RGBA')
-    similarity_map = similarity_plot(tif_path, block_size, threshold)
 
-    # Normalize and apply colormap
-    norm = Normalize(vmin=0, vmax=1)
+    # Generate similarity map
+    image = Image.open(tif_path).convert('L')
+    image_matrix = np.array(image)
+    rows, cols = image_matrix.shape
+    block_list = [
+        image_matrix[row:row + block_size, col:col + block_size]
+        for row in range(0, rows, block_size)
+        for col in range(0, cols, block_size)
+    ]
+    similarity_indices = [
+        similarity_index_for_matrix(tif_path, block, block_size, threshold)
+        for block in block_list
+    ]
+    similarity_map = np.zeros((rows, cols), dtype=float)
+    for idx, block in enumerate(block_list):
+        row_start = (idx // (cols // block_size)) * block_size
+        col_start = (idx % (cols // block_size)) * block_size
+        similarity_map[row_start:row_start + block_size, col_start:col_start + block_size] = similarity_indices[idx]
+
+    # Apply colormap
     colormap = cm.get_cmap('coolwarm')
-    colored_similarity = colormap(norm(similarity_map))
-    overlay_image = Image.fromarray((colored_similarity * 255).astype(np.uint8)).convert('RGBA')
+    colored_array = colormap(similarity_map)
+    overlay_image = Image.fromarray((colored_array[:, :, :3] * 255).astype(np.uint8)).convert('RGBA')
 
-    # Adjust alpha channel
-    alpha_channel = overlay_image.split()[3]
-    alpha_channel = alpha_channel.point(lambda p: int(p * alpha))
-    overlay_image.putalpha(alpha_channel)
+    # Adjust alpha for overlay
+    r, g, b, a = overlay_image.split()
+    a = a.point(lambda p: int(p * alpha))
+    overlay_image.putalpha(a)
 
     # Composite images
     combined_image = Image.alpha_composite(base_image, overlay_image)
-
-    # Display combined image
-    plt.figure(figsize=(10, 10))
-    plt.imshow(combined_image)
-    plt.axis('off')
-
-    # Add color bar
-    sm = ScalarMappable(norm=norm, cmap=colormap)
-    sm.set_array([])
-    plt.colorbar(sm, orientation='vertical', label='Similarity Index (0 to 1)')
-
-    plt.show()
-
+    combined_image.show()
     return combined_image
+
 
 def lower_resolution_tif(input_tif_path, output_tif_path, scale_factor):
     """
-    Reduces the resolution of a TIFF image by a scale factor.
+    Reduces the resolution of a TIFF image and saves the result.
     """
     image = Image.open(input_tif_path)
-    new_width = int(image.width / scale_factor)
-    new_height = int(image.height / scale_factor)
+    new_width, new_height = image.width // scale_factor, image.height // scale_factor
     resized_image = image.resize((new_width, new_height), Image.LANCZOS)
     resized_image.save(output_tif_path, format='TIFF')
 
-if __name__ == "__main__":
-    # Example usage
-    tif_path = '/path/to/your/image.tif'  # Replace with your TIFF file path
-    output_path = '/path/to/save/combined_image.tif'  # Replace with your desired output path
 
-    # Set parameters
+# Example usage
+if __name__ == "__main__":
+    tif_path = "/path/to/your/input.tif"  # Replace with your file path
+    output_tif = "/path/to/your/output.tif"  # Replace with desired output path
     block_size = 20
     threshold = 0.8
     alpha = 0.7
 
     # Generate and save the combined similarity plot
     combined_image = combined_similarity_plot(tif_path, block_size, threshold, alpha)
-    combined_image.save(output_path, format='TIFF')
+    combined_image.save(output_tif, format="TIFF")
